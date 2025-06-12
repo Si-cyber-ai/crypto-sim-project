@@ -10,6 +10,7 @@ from sklearn.preprocessing import StandardScaler
 import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime, timedelta
+from sklearn.metrics import confusion_matrix, classification_report
 
 # Set page config
 st.set_page_config(
@@ -21,55 +22,53 @@ st.set_page_config(
 # Load models and data
 @st.cache_resource
 def load_models():
-    models_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
+    """Load all required models and scalers."""
+    st.sidebar.subheader("Model Status")
     
     # Load fraud detection model
     try:
-        fraud_model = joblib.load(os.path.join(models_dir, "fraud_detection_model.pkl"))
+        # First try to load improved model, then fall back to original
+        try:
+            fraud_model = joblib.load("models/improved_fraud_detection_model.pkl")
+            st.sidebar.success("✅ Using improved fraud detection model")
+        except:
+            fraud_model = joblib.load("models/fraud_detection_model.pkl")
+            st.sidebar.info("ℹ️ Using original fraud detection model")
     except Exception as e:
-        st.error(f"Error loading fraud model: {e}")
+        st.sidebar.error(f"❌ Error loading fraud model: {e}")
         fraud_model = None
     
-    # Load volatility model
+    # Load volatility prediction model
     try:
-        # Import the model architecture
-        from model_architecture import TransformerModel
-        
-        # Load model architecture
-        volatility_model_path = os.path.join(models_dir, "volatility_model.pt")
-        volatility_scaler_path = os.path.join(models_dir, "volatility_scaler.pkl")
-        seq_length_path = os.path.join(models_dir, "sequence_length.pkl")
-        
         # Load sequence length
-        seq_length = joblib.load(seq_length_path)
+        seq_length = joblib.load("models/sequence_length.pkl")
         
         # Load scaler
-        volatility_scaler = joblib.load(volatility_scaler_path)
+        volatility_scaler = joblib.load("models/volatility_scaler.pkl")
         
         # Determine input dimension from scaler
-        input_dim = len(volatility_scaler.mean_)
+        input_dim = volatility_scaler.n_features_in_
         
         # Initialize model
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         volatility_model = TransformerModel(input_dim=input_dim).to(device)
         
-        # Try to load state dict directly
-        try:
-            volatility_model.load_state_dict(torch.load(volatility_model_path, map_location=device))
-        except Exception as e:
-            # If direct loading fails, try to adapt the old state dict
-            st.warning("Using model adapter to load old model format")
-            from model_adapter import adapt_old_state_dict
-            old_state_dict = torch.load(volatility_model_path, map_location=device)
-            new_state_dict = adapt_old_state_dict(old_state_dict, volatility_model)
-            volatility_model.load_state_dict(new_state_dict, strict=False)
-            
+        # Load model weights
+        volatility_model.load_state_dict(torch.load("models/best_transformer_model.pt", map_location=device))
         volatility_model.eval()
         
-        return fraud_model, volatility_model, volatility_scaler, seq_length
+        st.sidebar.success("✅ Volatility model loaded successfully")
+        
+        # Log model details
+        if st.sidebar.checkbox("Show model details"):
+            st.sidebar.code(f"Device: {device}\nInput dim: {input_dim}\nSeq length: {seq_length}")
     except Exception as e:
-        st.error(f"Error loading volatility model: {e}")
-        return fraud_model, None, None, None
+        st.sidebar.error(f"❌ Error loading volatility model: {e}")
+        volatility_model = None
+        volatility_scaler = None
+        seq_length = None
+    
+    return fraud_model, volatility_model, volatility_scaler, seq_length
 
 @st.cache_data
 def load_data(data_path="../data/crypto_volatility_fraud_dataset.csv"):
@@ -116,122 +115,151 @@ def create_sequences(data, seq_length):
         xs.append(x)
     return np.array(xs)
 
-def forecast_volatility(model, scaler, last_sequence, forecast_horizon, feature_names=None):
-    """
-    Generate recursive forecasts using the transformer model.
-    
-    Args:
-        model: Trained transformer model
-        scaler: Fitted scaler for the features
-        last_sequence: Last known sequence of data (scaled)
-        forecast_horizon: Number of steps to forecast
-        feature_names: Names of features (for debugging)
-        
-    Returns:
-        Array of forecasted volatility values
-    """
-    model.eval()
-    device = next(model.parameters()).device
-    
-    # Make a copy of the last sequence to avoid modifying the original
-    current_sequence = last_sequence.copy()
-    forecasts = []
-    
-    # Convert to tensor for initial prediction
-    with torch.no_grad():
-        for _ in range(forecast_horizon):
-            # Convert current sequence to tensor
-            sequence_tensor = torch.FloatTensor(current_sequence).unsqueeze(0).to(device)
-            
-            # Make prediction for next step
-            next_pred = model(sequence_tensor).cpu().numpy()
-            
-            # Store the prediction
-            if isinstance(next_pred, np.ndarray) and next_pred.size > 0:
-                next_value = next_pred.item() if next_pred.size == 1 else next_pred[0]
-            else:
-                next_value = float(next_pred)
-            
-            forecasts.append(next_value)
-            
-            # Update sequence for next prediction by removing oldest entry and adding new prediction
-            # Create a new row with the same feature values as the last row, but update the target
-            new_row = current_sequence[-1].copy()
-            
-            # Assuming the target (volatility) is the first feature in the scaled data
-            # This might need adjustment based on your specific feature ordering
-            new_row[0] = next_value
-            
-            # Remove the oldest entry and add the new prediction
-            current_sequence = np.vstack([current_sequence[1:], new_row])
-    
-    return np.array(forecasts)
-
-def predict_volatility(model, scaler, data, seq_length):
-    """Make volatility predictions using the trained model."""
+def forecast_volatility(model, scaler, data, seq_length, forecast_horizon=30):
+    """Generate volatility forecast using the transformer model."""
     try:
-        # Get the feature names used during training
+        # Prepare data for prediction
+        numeric_data = data.select_dtypes(include=['number'])
+        
+        # Ensure we have the right features for the scaler
         if hasattr(scaler, 'feature_names_in_'):
-            train_features = scaler.feature_names_in_
+            feature_names = scaler.feature_names_in_
             
-            # Ensure all required features exist in the data
-            if isinstance(data, pd.DataFrame):
-                for feature in train_features:
-                    if feature not in data.columns:
-                        st.warning(f"Adding missing feature: {feature}")
-                        data[feature] = 0
-                
-                # Reorder columns to match training features
-                data = data[train_features]
+            # Check if all required features exist
+            missing_features = [f for f in feature_names if f not in numeric_data.columns]
+            if missing_features:
+                st.warning(f"Missing features: {', '.join(missing_features)}")
+                # Add missing features with zeros
+                for feature in missing_features:
+                    numeric_data[feature] = 0
+            
+            # Reorder columns to match training features
+            numeric_data = numeric_data[feature_names]
         
         # Scale the data
-        try:
-            data_scaled = scaler.transform(data)
-        except ValueError as e:
-            st.error(f"Scaling error: {e}")
-            
-            # As a last resort, create a dummy array with the right number of features
-            if hasattr(scaler, 'n_features_in_'):
-                st.warning(f"Creating dummy data with {scaler.n_features_in_} features")
-                dummy_data = np.zeros((len(data), scaler.n_features_in_))
-                # Copy available data
-                if isinstance(data, pd.DataFrame):
-                    for i, col in enumerate(data.columns):
-                        if i < scaler.n_features_in_:
-                            dummy_data[:, i] = data[col].values
-                else:
-                    dummy_data[:, :min(data.shape[1], scaler.n_features_in_)] = data[:, :min(data.shape[1], scaler.n_features_in_)]
-                
-                data_scaled = scaler.transform(dummy_data)
-            else:
-                raise e
+        scaled_data = scaler.transform(numeric_data)
+        st.write(f"Scaled data shape: {scaled_data.shape}")
         
         # Create sequences
         sequences = []
-        for i in range(len(data_scaled) - seq_length + 1):
-            seq = data_scaled[i:i+seq_length]
+        for i in range(len(scaled_data) - seq_length + 1):
+            seq = scaled_data[i:i+seq_length]
             sequences.append(seq)
         
-        # Convert to tensor
+        sequences = np.array(sequences)
+        st.write(f"Created {len(sequences)} sequences with shape {sequences.shape}")
+        
         if len(sequences) == 0:
-            st.warning("No sequences could be created. Data may be too short for the sequence length.")
-            # Return a small array with a default prediction instead of empty array
-            return np.array([[0.02]]), []  # Default volatility value of 2% and empty sequences
-            
-        X = torch.FloatTensor(np.array(sequences))
+            st.error("No sequences could be created. Data may be too short.")
+            return None
         
-        # Make predictions
+        # Get the last sequence for forecasting
+        last_sequence = sequences[-1]
+        
+        # Make initial prediction
+        device = next(model.parameters()).device
         model.eval()
-        with torch.no_grad():
-            predictions = model(X).cpu().numpy()
+        current_sequence = last_sequence.copy()
+        forecasted_values = []
+        dates = []
         
-        return predictions, sequences
+        # Get the last date from the data
+        last_date = data['date'].iloc[-1]
+        
+        with torch.no_grad():
+            for i in range(forecast_horizon):
+                # Convert sequence to tensor
+                sequence_tensor = torch.FloatTensor(current_sequence).unsqueeze(0).to(device)
+                
+                # Make prediction
+                prediction = model(sequence_tensor).cpu().numpy()
+                
+                # Get the predicted value
+                predicted_value = prediction.item() if hasattr(prediction, 'item') else prediction[0]
+                
+                # Store the prediction
+                forecasted_values.append(predicted_value)
+                
+                # Calculate the next date
+                next_date = last_date + timedelta(days=i+1)
+                dates.append(next_date)
+                
+                # Update the sequence for the next prediction
+                # Create a new row with the same feature values as the last row
+                new_row = current_sequence[-1].copy()
+                
+                # Update the volatility value (assuming it's the target feature)
+                # This might need adjustment based on your specific feature ordering
+                volatility_index = list(feature_names).index('volatility') if 'volatility' in feature_names else 0
+                new_row[volatility_index] = predicted_value
+                
+                # Remove the oldest entry and add the new prediction
+                current_sequence = np.vstack([current_sequence[1:], new_row])
+        
+        # Create a DataFrame with the forecasted values
+        forecast_df = pd.DataFrame({
+            'date': dates,
+            'forecasted_volatility': forecasted_values
+        })
+        
+        # Log unique values to check for flat forecasts
+        unique_values = np.unique(forecasted_values)
+        st.write(f"Number of unique forecast values: {len(unique_values)}")
+        
+        return forecast_df
+    
     except Exception as e:
-        st.error(f"Error in volatility prediction: {e}")
+        st.error(f"Error in forecast_volatility: {e}")
         import traceback
         st.error(traceback.format_exc())
-        # Return a small array with a default prediction instead of empty array
-        return np.array([[0.02]]), []  # Default volatility value of 2% and empty sequences
+        return None
+
+def predict_fraud(model, data):
+    """Predict fraud using the trained model."""
+    try:
+        # Prepare data for prediction
+        X = data.drop(columns=['fraud_label', 'volatility', 'date'], errors='ignore')
+        
+        # Make predictions
+        predictions = model.predict(X)
+        probabilities = model.predict_proba(X)[:, 1]
+        
+        # Add predictions to the data
+        result_df = data.copy()
+        result_df['fraud_prediction'] = predictions
+        result_df['fraud_probability'] = probabilities
+        
+        # Log prediction statistics
+        fraud_count = predictions.sum()
+        total_count = len(predictions)
+        st.write(f"Predicted {fraud_count} fraudulent transactions out of {total_count} ({fraud_count/total_count:.2%})")
+        
+        # If actual fraud labels exist, calculate metrics
+        if 'fraud_label' in data.columns:
+            y_true = data['fraud_label']
+            
+            # Create confusion matrix
+            cm = confusion_matrix(y_true, predictions)
+            fig, ax = plt.subplots(figsize=(8, 6))
+            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax)
+            plt.title('Fraud Detection Confusion Matrix')
+            plt.xlabel('Predicted Label')
+            plt.ylabel('True Label')
+            st.pyplot(fig)
+            
+            # Display classification report
+            report = classification_report(y_true, predictions, output_dict=True)
+            report_df = pd.DataFrame(report).transpose()
+            st.write("Classification Report:")
+            st.dataframe(report_df)
+        
+        return result_df
+    
+    except Exception as e:
+        st.error(f"Error in predict_fraud: {e}")
+        import traceback
+        st.error(traceback.format_exc())
+        return None
 
 def main():
     st.title("Cryptocurrency Fraud & Volatility Dashboard")
@@ -241,7 +269,7 @@ def main():
     
     # Sidebar
     st.sidebar.title("Controls")
-    data_path = st.sidebar.text_input("Data Path", "../data/crypto_volatility_fraud_dataset.csv")
+    data_path = st.sidebar.text_input("Data Path", "data/crypto_volatility_fraud_dataset.csv")
     
     # Load data
     df = load_data(data_path)
@@ -258,359 +286,136 @@ def main():
         st.header("Dataset Overview")
         
         # Display basic statistics
-        st.subheader("Dataset Information")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Total Records", f"{len(df):,}")
-        col2.metric("Time Period", f"{df['date'].min().date()} to {df['date'].max().date()}")
-        col3.metric("Fraud Ratio", f"{df['fraud_label'].mean():.2%}")
+        st.subheader("Data Preview")
+        st.dataframe(df.head())
         
-        # Price and volume chart
-        st.subheader("Price and Volume Over Time")
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=df['date'], 
-            y=df['price'],
-            name='Price',
-            line=dict(color='blue')
-        ))
+        st.subheader("Dataset Statistics")
+        st.write(f"Total records: {len(df)}")
+        st.write(f"Date range: {df['date'].min()} to {df['date'].max()}")
         
-        fig.add_trace(go.Scatter(
-            x=df['date'], 
-            y=df['on_chain_volume'] / df['on_chain_volume'].max() * df['price'].max() * 0.8,
-            name='Volume (Scaled)',
-            line=dict(color='gray', dash='dot')
-        ))
+        if 'fraud_label' in df.columns:
+            fraud_count = df['fraud_label'].sum()
+            st.write(f"Fraud transactions: {fraud_count} ({fraud_count/len(df):.2%})")
         
-        # Add fraud markers
-        fraud_df = df[df['fraud_label'] == 1]
-        fig.add_trace(go.Scatter(
-            x=fraud_df['date'], 
-            y=fraud_df['price'],
-            mode='markers',
-            name='Fraud',
-            marker=dict(color='red', size=8, symbol='x')
-        ))
+        # Plot price and volatility
+        st.subheader("Price and Volatility")
+        fig, ax1 = plt.subplots(figsize=(12, 6))
         
-        fig.update_layout(
-            title='Price and Volume with Fraud Markers',
-            xaxis_title='Date',
-            yaxis_title='Price',
-            legend=dict(x=0, y=1),
-            height=500
-        )
+        ax1.set_xlabel('Date')
+        ax1.set_ylabel('Price', color='tab:blue')
+        ax1.plot(df['date'], df['price'], color='tab:blue')
+        ax1.tick_params(axis='y', labelcolor='tab:blue')
         
-        st.plotly_chart(fig, use_container_width=True)
+        ax2 = ax1.twinx()
+        ax2.set_ylabel('Volatility', color='tab:red')
+        ax2.plot(df['date'], df['volatility'], color='tab:red')
+        ax2.tick_params(axis='y', labelcolor='tab:red')
         
-        # Correlation heatmap
-        st.subheader("Feature Correlations")
-        numeric_df = df.select_dtypes(include=['float64', 'int64'])
-        corr = numeric_df.corr()
+        fig.tight_layout()
+        st.pyplot(fig)
         
-        fig = px.imshow(
-            corr,
-            text_auto='.2f',
-            aspect="auto",
-            color_continuous_scale='RdBu_r'
-        )
-        fig.update_layout(height=600)
-        st.plotly_chart(fig, use_container_width=True)
+        # Plot on-chain volume
+        st.subheader("On-Chain Volume")
+        fig, ax = plt.subplots(figsize=(12, 6))
+        ax.plot(df['date'], df['on_chain_volume'])
+        ax.set_xlabel('Date')
+        ax.set_ylabel('Volume')
+        ax.grid(True, alpha=0.3)
+        st.pyplot(fig)
     
     with tab2:
-        st.header("Fraud Detection Analysis")
+        st.header("Fraud Detection")
         
         if fraud_model is None:
-            st.warning("Fraud detection model not loaded. Please train the model first.")
-        else:
-            # Feature importance
-            if hasattr(fraud_model, 'named_steps') and hasattr(fraud_model.named_steps['classifier'], 'feature_importances_'):
-                st.subheader("Feature Importance")
-                
-                # Get feature names and importances
-                feature_names = df.drop(columns=['date', 'fraud_label', 'volatility']).columns
-                importances = fraud_model.named_steps['classifier'].feature_importances_
-                
-                # Sort by importance
-                indices = np.argsort(importances)[::-1]
-                top_n = min(15, len(feature_names))
-                
-                fig, ax = plt.subplots(figsize=(10, 6))
-                ax.barh(range(top_n), importances[indices][:top_n], align='center')
-                ax.set_yticks(range(top_n))
-                ax.set_yticklabels([feature_names[i] for i in indices[:top_n]])
-                ax.set_xlabel('Feature Importance')
-                ax.set_title('Top Features for Fraud Detection')
-                st.pyplot(fig)
+            st.error("Fraud detection model not loaded. Please check the model files.")
+            return
+        
+        # Predict fraud
+        fraud_results = predict_fraud(fraud_model, df)
+        
+        if fraud_results is not None:
+            # Display fraud predictions
+            st.subheader("Fraud Predictions")
             
-            # Fraud distribution over time
-            st.subheader("Fraud Distribution Over Time")
+            # Filter to show only fraudulent transactions
+            show_fraudulent = st.checkbox("Show only fraudulent transactions")
+            if show_fraudulent:
+                filtered_df = fraud_results[fraud_results['fraud_prediction'] == 1]
+            else:
+                filtered_df = fraud_results
             
-            # Group by day and count frauds
-            df['date_day'] = df['date'].dt.date
-            fraud_by_day = df.groupby('date_day')['fraud_label'].mean().reset_index()
-            fraud_by_day['fraud_percentage'] = fraud_by_day['fraud_label'] * 100
+            st.dataframe(filtered_df[['date', 'price', 'transaction_size', 'fraud_prediction', 'fraud_probability']])
             
-            fig = px.line(
-                fraud_by_day, 
-                x='date_day', 
-                y='fraud_percentage',
-                labels={'date_day': 'Date', 'fraud_percentage': 'Fraud Percentage (%)'},
-                title='Daily Fraud Percentage'
-            )
-            st.plotly_chart(fig, use_container_width=True)
+            # Plot fraud probability distribution
+            st.subheader("Fraud Probability Distribution")
+            fig, ax = plt.subplots(figsize=(10, 6))
+            sns.histplot(fraud_results['fraud_probability'], bins=30, kde=True, ax=ax)
+            ax.set_xlabel('Fraud Probability')
+            ax.set_ylabel('Count')
+            ax.grid(True, alpha=0.3)
+            st.pyplot(fig)
             
-            # Fraud vs. legitimate transaction characteristics
-            st.subheader("Fraud vs. Legitimate Transaction Characteristics")
-            
-            # Select features to compare
-            compare_features = ['transaction_size', 'wallet_age', 'transaction_fee']
-            
-            fig = go.Figure()
-            for feature in compare_features:
-                fig.add_trace(go.Box(
-                    y=df[df['fraud_label'] == 0][feature],
-                    name=f'Legitimate - {feature}',
-                    boxmean=True
-                ))
-                fig.add_trace(go.Box(
-                    y=df[df['fraud_label'] == 1][feature],
-                    name=f'Fraud - {feature}',
-                    boxmean=True
-                ))
-            
-            fig.update_layout(
-                title='Transaction Characteristics Comparison',
-                yaxis_title='Value',
-                boxmode='group'
-            )
-            st.plotly_chart(fig, use_container_width=True)
+            # Save predictions
+            if st.button("Save Fraud Predictions"):
+                fraud_results.to_csv("outputs/fraud_predictions.csv", index=False)
+                st.success("Fraud predictions saved to outputs/fraud_predictions.csv")
     
     with tab3:
         st.header("Volatility Prediction")
         
         if volatility_model is None or volatility_scaler is None:
-            st.warning("Volatility prediction model not loaded. Please train the model first.")
-        else:
-            # Actual vs. Predicted Volatility
-            st.subheader("Actual vs. Predicted Volatility")
-            
-            # Check what features the scaler was trained on
-            if hasattr(volatility_scaler, 'feature_names_in_'):
-                st.info(f"Model was trained with these features: {', '.join(volatility_scaler.feature_names_in_)}")
-            
-            # Prepare data for prediction - ensure we're using the right columns
-            try:
-                # First try: Use all numeric columns except target variables
-                X = df.select_dtypes(include=['number']).drop(columns=['fraud_label'], errors='ignore')
-                
-                # Make predictions
-                predictions, sequences = predict_volatility(volatility_model, volatility_scaler, X, seq_length)
-                
-                # Create a dataframe with predictions
-                if len(predictions) > 0:
-                    pred_df = pd.DataFrame({
-                        'date': df['date'][seq_length-1:seq_length-1+len(predictions)],
-                        'actual': df['volatility'][seq_length-1:seq_length-1+len(predictions)],
-                        'predicted': predictions.flatten()
-                    })
-                    
-                    # Plot
-                    fig = go.Figure()
-                    fig.add_trace(go.Scatter(
-                        x=pred_df['date'], 
-                        y=pred_df['actual'],
-                        name='Actual Volatility',
-                        line=dict(color='blue')
-                    ))
-                    fig.add_trace(go.Scatter(
-                        x=pred_df['date'], 
-                        y=pred_df['predicted'],
-                        name='Predicted Volatility',
-                        line=dict(color='red')
-                    ))
-                    
-                    fig.update_layout(
-                        title='Actual vs. Predicted Volatility',
-                        xaxis_title='Date',
-                        yaxis_title='Volatility',
-                        legend=dict(x=0, y=1),
-                        height=500
-                    )
-                    
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.warning("No predictions could be generated. The data may be too short for the sequence length.")
-            
-            except Exception as e:
-                st.error(f"Error in volatility prediction: {e}")
-                import traceback
-                st.error(traceback.format_exc())
-            
-            # Volatility vs. Price
-            st.subheader("Volatility vs. Price")
-            
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=df['date'], 
-                y=df['price'],
-                name='Price',
-                line=dict(color='blue')
-            ))
-            
-            fig.add_trace(go.Scatter(
-                x=df['date'], 
-                y=df['volatility'] * df['price'].max() * 0.2,  # Scale for visibility
-                name='Volatility (Scaled)',
-                line=dict(color='orange')
-            ))
-            
-            fig.update_layout(
-                title='Price and Volatility Over Time',
-                xaxis_title='Date',
-                yaxis_title='Value',
-                legend=dict(x=0, y=1),
-                height=500
-            )
-            
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Volatility Forecast
-            st.subheader("Volatility Forecast")
-
-            # Get the latest data for forecasting
-            forecast_days = st.slider("Forecast Days", 1, 30, 7)
-
-            st.info("Note: This forecast uses recursive prediction where each prediction becomes input for the next step.")
-
-            # Create a simple forecast by repeating the last prediction
-            last_date = df['date'].max()
-            forecast_dates = [last_date + timedelta(days=i) for i in range(1, forecast_days+1)]
-
-            # Check if we have predictions before accessing them
-            if 'X_volatility' in locals() and volatility_model is not None and volatility_scaler is not None:
-                try:
-                    # Make predictions and get sequences
-                    predictions, sequences = predict_volatility(volatility_model, volatility_scaler, X_volatility, seq_length)
-                    
-                    # Check if we have predictions and sequences
-                    if len(predictions) > 0 and len(sequences) > 0:
-                        # Get the last sequence for forecasting
-                        last_sequence = sequences[-1]
-                        
-                        # Generate recursive forecasts
-                        forecast_values = forecast_volatility(
-                            volatility_model, 
-                            volatility_scaler, 
-                            last_sequence, 
-                            forecast_days,
-                            feature_names=X_volatility.columns if isinstance(X_volatility, pd.DataFrame) else None
-                        )
-                        
-                        # Create historical dataframe
-                        pred_df = pd.DataFrame({
-                            'date': df['date'][seq_length-1:seq_length-1+len(predictions)],
-                            'actual': df['volatility'][seq_length-1:seq_length-1+len(predictions)],
-                            'predicted': predictions.flatten()
-                        })
-                        
-                        # Combine historical and forecast data
-                        historical_df = pred_df[['date', 'predicted']].rename(columns={'predicted': 'volatility'})
-                        historical_df['type'] = 'Historical'
-                        
-                        forecast_df = pd.DataFrame({
-                            'date': forecast_dates,
-                            'volatility': forecast_values,
-                            'type': 'Forecast'
-                        })
-                        
-                        combined_df = pd.concat([historical_df.tail(30), forecast_df])
-                        
-                        # Plot
-                        fig = px.line(
-                            combined_df, 
-                            x='date', 
-                            y='volatility',
-                            color='type',
-                            title='Volatility Forecast',
-                            color_discrete_map={'Historical': 'blue', 'Forecast': 'red'}
-                        )
-                        
-                        fig.add_vrect(
-                            x0=last_date,
-                            x1=forecast_dates[-1],
-                            fillcolor="lightgray",
-                            opacity=0.3,
-                            layer="below",
-                            line_width=0
-                        )
-                        
-                        st.plotly_chart(fig, use_container_width=True)
-                    else:
-                        raise ValueError("No predictions or sequences available")
-                except Exception as e:
-                    st.error(f"Error generating forecast: {e}")
-                    import traceback
-                    st.error(traceback.format_exc())
-                    # Fallback to simple forecast with some randomness
-                    st.warning("Using fallback forecast due to error")
-                    
-                    # Create a placeholder forecast with random values
-                    import random
-                    placeholder_volatility = 0.02  # A reasonable default volatility value
-                    random_volatility = [placeholder_volatility * (1 + 0.05 * (i/forecast_days) + (random.random() - 0.5) * 0.1) for i in range(forecast_days)]
-                    
-                    # Create a dataframe for the placeholder forecast
-                    forecast_df = pd.DataFrame({
-                        'date': forecast_dates,
-                        'volatility': random_volatility,
-                        'type': 'Placeholder Forecast'
-                    })
-                    
-                    # Plot the placeholder forecast
-                    fig = px.line(
-                        forecast_df, 
-                        x='date', 
-                        y='volatility',
-                        title='Placeholder Volatility Forecast',
-                        color_discrete_map={'Placeholder Forecast': 'gray'}
-                    )
-                    
-                    st.plotly_chart(fig, use_container_width=True)
-            else:
-                # If no predictions are available, show a placeholder forecast
-                st.warning("No predictions available for forecasting. Showing placeholder forecast.")
-                
-                # Create a placeholder forecast with random values
-                import random
-                placeholder_volatility = 0.02  # A reasonable default volatility value
-                random_volatility = [placeholder_volatility * (1 + 0.05 * (i/forecast_days) + (random.random() - 0.5) * 0.1) for i in range(forecast_days)]
-                
-                # Create a dataframe for the placeholder forecast
-                forecast_df = pd.DataFrame({
-                    'date': forecast_dates,
-                    'volatility': random_volatility,
-                    'type': 'Placeholder Forecast'
-                })
-                
-                # Plot the placeholder forecast
-                fig = px.line(
-                    forecast_df, 
-                    x='date', 
-                    y='volatility',
-                    title='Placeholder Volatility Forecast (No model predictions available)',
-                    color_discrete_map={'Placeholder Forecast': 'gray'}
+            st.error("Volatility prediction model not loaded. Please check the model files.")
+            return
+        
+        # Forecast settings
+        st.subheader("Forecast Settings")
+        forecast_horizon = st.slider("Forecast Horizon (Days)", 1, 60, 30)
+        
+        # Generate forecast
+        if st.button("Generate Forecast"):
+            with st.spinner("Generating forecast..."):
+                forecast_df = forecast_volatility(
+                    model=volatility_model,
+                    scaler=volatility_scaler,
+                    data=df,
+                    seq_length=seq_length,
+                    forecast_horizon=forecast_horizon
                 )
                 
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # Show a message explaining how to fix this
-                st.info("To get actual forecasts, please ensure your data has all required features and is long enough for sequence-based prediction.")
+                if forecast_df is not None:
+                    # Display forecast
+                    st.subheader("Volatility Forecast")
+                    st.dataframe(forecast_df)
+                    
+                    # Plot forecast
+                    fig, ax = plt.subplots(figsize=(12, 6))
+                    
+                    # Plot historical volatility
+                    ax.plot(df['date'], df['volatility'], label='Historical Volatility', color='blue')
+                    
+                    # Plot forecasted volatility
+                    ax.plot(forecast_df['date'], forecast_df['forecasted_volatility'], 
+                            label='Forecasted Volatility', color='red', linestyle='--')
+                    
+                    # Add vertical line to separate historical and forecasted data
+                    ax.axvline(x=df['date'].iloc[-1], color='gray', linestyle='-', alpha=0.5)
+                    
+                    ax.set_title('Cryptocurrency Volatility Forecast')
+                    ax.set_xlabel('Date')
+                    ax.set_ylabel('Volatility')
+                    ax.legend()
+                    ax.grid(True, alpha=0.3)
+                    fig.tight_layout()
+                    st.pyplot(fig)
+                    
+                    # Save forecast
+                    if st.button("Save Forecast"):
+                        forecast_df.to_csv("outputs/forecast_results.csv", index=False)
+                        st.success("Forecast saved to outputs/forecast_results.csv")
+                else:
+                    st.error("Failed to generate forecast. Please check the logs for details.")
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
 
 

@@ -1,22 +1,25 @@
 import os
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, confusion_matrix
-from sklearn.preprocessing import StandardScaler
-import joblib
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+import joblib
 from imblearn.over_sampling import SMOTE
+import math
+import logging
 import warnings
 warnings.filterwarnings('ignore')
 
-# Import the consistent model architecture
-from model_architecture import TransformerModel
+# Import the TransformerModel from model_architecture.py
+from model_architecture import TransformerModel, PositionalEncoding
 
 # Create necessary directories
 os.makedirs('../models', exist_ok=True)
@@ -33,7 +36,14 @@ def preprocess_data(df):
     """Preprocess the dataset."""
     # Convert date to datetime if it exists
     if 'date' in df.columns:
-        df['date'] = pd.to_datetime(df['date'])
+        # Use errors='coerce' to handle any parsing errors and format='mixed' to infer format
+        df['date'] = pd.to_datetime(df['date'], errors='coerce', format='mixed', dayfirst=True)
+        
+        # Check for NaT values after conversion and print a warning
+        nat_count = df['date'].isna().sum()
+        if nat_count > 0:
+            print(f"Warning: {nat_count} date values couldn't be parsed and were set to NaT")
+            
         # Extract time-based features
         df['day_of_week'] = df['date'].dt.dayofweek
         df['month'] = df['date'].dt.month
@@ -197,13 +207,13 @@ def train_volatility_model(df):
     X_test = torch.FloatTensor(X_test)
     y_test = torch.FloatTensor(y_test)
     
-    # Initialize model with positional encoding
+    # Initialize model
     input_dim = X_train.shape[2]
-    model = TransformerModel(input_dim=input_dim, d_model=128, nhead=4, num_layers=3, dropout=0.2, max_seq_length=seq_length)
+    model = TransformerModel(input_dim=input_dim, d_model=128, nhead=4, num_layers=3, dropout=0.2)
     
-    # Use learning rate scheduler
+    # Use learning rate scheduler - remove verbose parameter
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
     
     # Train for more epochs
     num_epochs = 100  # Increased from default
@@ -240,10 +250,16 @@ def train_volatility_model(df):
             val_loss = criterion(val_outputs, y_test).item()
         
         # Update learning rate
+        prev_lr = optimizer.param_groups[0]['lr']
         scheduler.step(val_loss)
+        current_lr = optimizer.param_groups[0]['lr']
         
         # Print progress
         print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss/len(X_train):.6f}, Val Loss: {val_loss:.6f}')
+        
+        # Print learning rate changes
+        if current_lr != prev_lr:
+            print(f'Learning rate changed from {prev_lr:.6f} to {current_lr:.6f}')
         
         # Early stopping
         if val_loss < best_val_loss:
